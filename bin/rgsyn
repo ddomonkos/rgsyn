@@ -1,0 +1,357 @@
+#!/usr/bin/env ruby
+
+#temporary solution, so that we don't need to install it as a gem
+$LOAD_PATH.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
+
+require 'rubygems' if RUBY_VERSION < '1.9'
+require 'rgsyn'
+require 'rgsyn/printer'
+require 'highline/import'
+require 'ostruct'
+require 'optparse'
+
+CONFIG_PRIMARY = "~/.rgsyn.yml"
+CONFIG_SECONDARY = File.expand_path("../config.yml", File.dirname(__FILE__))
+OK = 'OK!'
+HELP = <<-EOS
+Usage:
+     #{$0} COMMAND [ARGUMENT(S)] [SWITCH(ES)] 
+
+Commands:
+     host                      Print the currently set host.
+     host URL                  Set host.
+     host-info                 Get information about the host.
+     yum-setup                 Setup Yum so that it can download from the
+                               host's repository(s); switch --os is mandatory
+                               (your operating system).
+     yum-undo                  Undo all yum-setup operations.
+     
+     username                  Print the implicit username (if set).
+     username NAME             Set implicit username.
+     changepw                  Change password. (interactive)
+     
+     list                      List all libraries present on the host.
+     info IDENT                Show information about specified library, IDENT
+                               is its unique identifier (which can either be
+                               its ID or a prefix of its NAME-VERSION).
+     upload FILE[, ..]         upload package(s)
+     gem2rpm IDENT             Execute Gem->RPM conversion on specified library.
+                               The library must have a Gem already. You can
+                               specify the target operating system of resulting
+                               RPMs by using the --os switch.
+     rpm2gem IDENT             Execute RPM->Gem conversion on specified library.
+                               The library must have at least one RPM. If there
+                               are RPMs for multiple operating system, switch
+                               --os must be used to identify which RPMs should
+                               be used in the conversion.
+     specfile IDENT            Generate and print specfile for a specified
+                               library. Use the --os switch to specify
+                               the target operating system.
+     delete IDENT              Delete library from the host (and all associated
+                               packages).
+     log IDENT                 Show the (more) detailed log of a specified
+                               library.
+     log IDENT/ID/LOGFILE      Show specified Mock log.
+                               
+     help                      show this help and exit
+     version                   show version
+
+     user-list                 List all users.
+     user-create NAME PW [RIGHTS]   Create a new user. Possible RIGHTS are
+                               'regular', 'admin', and 'restricted'.
+     user-delete UID           Delete a user with specified user ID.
+     user-rights UID RIGHTS    Change user's access rights.
+     user-changepw UID PW      Change user's password.
+
+Options:
+    -f, --force                Force operation. (overrides old packages if they
+                               exist)
+        --license              Specify the license; used for RPM specfiles.
+                               (usable with commands 'specfile' and 'gem2rpm')
+        --dep DEP              Add a dependency to an RPM specfile.
+        --bdep DEP             Add a build dependency to an RPM specfile.
+        --os OS                Specify operating system.
+        --specfile FILE        Specify a specfile. (for the 'gem2rpm' command)
+    -u, --username NAME        Set login username.
+    -p, --password PW          Set login password.
+                               
+
+Examples:
+     #{$0} host http://example.com
+     #{$0} yum-setup --os=fc16
+     #{$0} upload rubygem-mylib.src.rpm rubygem-mylib.noarch.rpm
+     #{$0} gem2rpm mylib --os=fc17
+     #{$0} specfile mylib --dep=mylib2 --bdep=mylib2-devel --license=GNU
+     #{$0} log mylib/1/build.log
+EOS
+
+def bad_args
+  puts HELP  # 'Invalid command format! See help for more.'
+  exit 1
+end
+
+def auth!
+  $credentials[:username] ||=
+    begin
+      print "Enter username: "
+      $stdin.gets.chomp
+    end
+  $credentials[:password] ||= ask("Enter password: ") { |q| q.echo = false }
+end
+
+trap('INT') { puts; exit 1 }
+
+config_file = File.exists?(CONFIG_PRIMARY) ? CONFIG_PRIMARY : CONFIG_SECONDARY
+
+$instance = Rgsyn.new(config_file)
+$credentials = {:username => $instance.username,
+                :password => nil}
+
+params = {:deps => [], :bdeps => []}
+data = nil
+
+opts = OptionParser.new do |opts|
+  opts.on('-f', '--force') { params[:force] = true }
+  opts.on('-u', '--username NAME') { |name| $credentials[:username] = name }
+  opts.on('-p', '--password PW') { |pw| $credentials[:password] = pw }
+  opts.on('--os OS') { |os| params[:os] = os }
+  opts.on('--specfile FILE') { |file| data = File.new(file, 'rb') }
+  opts.on('--license LICENSE') { |license| params[:license] = license }
+  opts.on('--dep DEP') { |dep| params[:deps] << dep }
+  opts.on('--bdep DEP') { |bdep| params[:bdeps] << bdep }
+end
+
+rest = opts.permute(ARGV)
+params[:deps] = params[:deps].to_json
+params[:bdeps] = params[:bdeps].to_json
+cmd = rest.shift
+
+begin
+  case cmd
+  when 'host'
+    bad_args if rest.size > 1
+    if rest.size == 1
+      $instance.host = (rest[0] != '-') ? rest[0] : nil
+      begin
+        if $instance.host_valid? then puts OK
+        else
+          $stderr.puts 'Warning: The host does not seem to be valid Rgsyn '\
+            'server!'
+        end
+      rescue Errno::ECONNREFUSED
+        $stderr.puts 'Warning: Unable to connect to the host!'
+      end
+    else
+      puts $instance.host || '-'
+    end
+    
+  when 'host-info'
+    bad_args unless rest.empty?
+    info = $instance.talk(:get, 'info')
+    puts "Server version: #{info['version']}"
+    puts "Supported operating systems: #{info['os'].join(', ')}"
+    puts "Supported CPU architectures: #{info['arch'].join(', ')}"
+    
+  when 'username'
+    bad_args if rest.size > 1
+    if rest.size == 1
+      $instance.username = (rest[0] != '-') ? rest[0] : nil
+      puts OK
+    else
+      puts $instance.username || '-'
+    end
+    
+  when 'yum-setup'
+    bad_args if ! rest.empty? || ! params.has_key?(:os)
+    unless $instance.talk(:get, 'info')['os'].include?(rest[0])
+      $stderr.puts "Warning: The host doesn't support this operating system."
+      print 'Continue? (y/n): '
+      input = $stdin.gets.chomp
+      exit 0 if input.downcase != 'y'
+    end
+    begin
+      if $instance.yum_setup(params[:os])
+        puts OK
+      else
+        $stderr.puts "Error: Yum seems to be already set up for this host!"
+        exit 1
+      end
+    rescue Rgsyn::PermissionDeniedError
+      $stderr.puts "Error: Unable to create repo file! You might need to "\
+                   "run this as superuser!"
+      exit 1
+    end
+    
+  when 'yum-undo'
+    bad_args unless rest.empty?
+    begin
+      if $instance.yum_undo
+        puts OK
+      else
+        puts 'There were no files to be removed.'
+      end
+    rescue Rgsyn::PermissionDeniedError
+      $stderr.puts "Error: Unable to remove repo file(s)! You might need to "\
+        "run this as superuser!"
+      exit 1
+    end
+
+  when 'list'
+    bad_args unless rest.empty?
+    libraries = $instance.talk(:get, 'library')
+    Rgsyn::Printer.library_list(libraries)
+    
+  when 'info'
+    bad_args if rest.size != 1
+    library = $instance.talk(:get, "library/#{rest[0]}")
+    if library.instance_of?(Array)
+      puts "More libraries match the query:"
+      Rgsyn::Printer.list_choices(library)
+    else
+      Rgsyn::Printer.library_info(library)
+    end
+    
+  when 'log'
+    bad_args if rest.size != 1
+    ident, id, log = rest[0].split('/')
+    
+    if id.nil?
+      print $instance.talk(:get, "library/#{ident}/log")
+    elsif log.nil?
+      logs = $instance.talk(:get, "library/#{ident}/log/#{id}")
+      Rgsyn::Printer.list_choices(logs)
+    else
+      print $instance.talk(:get, "library/#{ident}/log/#{id}/#{log}")
+    end
+
+  when 'delete'
+    bad_args if rest.size != 1
+    auth!
+    
+    $instance.talk(:delete, "library/#{rest[0]}", nil, $credentials)
+    puts OK
+
+  when 'upload'
+    bad_args if rest.size < 1
+    auth!
+    
+    rest.each do |file|
+      print "Uploading #{file}... " if rest.size > 1
+      type =
+        case File.extname(file.downcase)
+        when '.gem' then 'gem'
+        when '.rpm' then 'rpm'
+        else
+          $stderr.puts "Can't resolve transaction type! Does the file have "\
+            "proper file extension?"
+          exit 1
+        end
+      info = $instance.talk(:put, "package/#{type}",
+                            params.merge(:data => File.new(file, 'rb')),
+                            $credentials)
+      puts OK
+    end
+    
+  when 'gem2rpm'
+    bad_args if rest.size != 1
+    auth!
+    
+    if data
+      $instance.talk(:put, "library/#{rest[0]}/gem2rpm",
+        params.merge(:data => data), $credentials)
+    else
+      $instance.talk(:put, "library/#{rest[0]}/gem2rpm", params, $credentials)
+    end
+    puts OK
+    
+  when 'rpm2gem'
+    bad_args if rest.size != 1
+    auth!
+    
+    $instance.talk(:put, "library/#{rest[0]}/rpm2gem", params, $credentials)
+    puts OK
+    
+  when 'specfile'
+    bad_args if rest.size != 1
+    
+    puts $instance.talk(:get, "library/#{rest[0]}/specfile", params)
+    
+  when 'user-list'
+    bad_args unless rest.empty?
+    auth!
+    
+    users = $instance.talk(:get, 'user', params, $credentials)
+    Rgsyn::Printer.user_list(users)
+    
+  when 'user-create'
+    bad_args unless rest.size == 2 || rest.size == 3
+    auth!
+    
+    params[:rights] = rest[2] if rest.size == 3
+    
+    $instance.talk(:put, "user",
+                   params.merge(:username => rest[0],
+                                :password => rest[1]),
+                   $credentials)
+    puts OK
+    
+  when 'user-delete'
+    bad_args if rest.size != 1
+    auth!
+    
+    $instance.talk(:delete, "user/#{rest[0]}", params, $credentials)
+    puts OK
+    
+  when 'changepw'
+    bad_args unless rest.empty?
+    auth!
+    
+    new_password1 = ask("Enter new password: ") { |q| q.echo = false }
+    new_password2 = ask("Enter new password again: ") { |q| q.echo = false }
+    if new_password1 != new_password2
+      $stderr.puts 'The two new passwords do not match!'
+      exit 1
+    end
+    params[:password] = new_password1
+    $instance.talk(:post, "user", params, $credentials)
+    puts OK
+    
+  when 'user-changepw'
+    bad_args if rest.size != 2
+    auth!
+    
+    params[:password] = rest[1]
+    $instance.talk(:post, "user/#{rest[0]}", params, $credentials)
+    puts OK
+        
+  when 'user-rights'
+    bad_args if rest.size != 2
+    auth!
+    
+    params[:rights] = rest[1]
+    $instance.talk(:post, "user/#{rest[0]}",
+                   params.merge(:rights => rest[1]), $credentials)
+    puts OK
+
+  when 'help', '--help', '-h'
+    puts HELP
+
+  when 'version'
+    puts Rgsyn::VERSION
+
+  else
+    puts 'Unknown command.'
+    puts "Try: #{$0} help"
+    exit 1
+  end
+  
+rescue Rgsyn::BadResponseError => ex
+  $stderr.puts ex.to_s
+  exit 1
+rescue Errno::ECONNREFUSED
+  $stderr.puts 'Error: Unable to connect to the host!'
+  exit 1
+rescue Rgsyn::HostNotSpecifiedError
+  $stderr.puts 'You need to set up a host first! See help.'
+  exit 1
+end
